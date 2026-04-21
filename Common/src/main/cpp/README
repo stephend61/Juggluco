@@ -11,6 +11,43 @@ To compile without logging and debug information (in a fresh directory):
 cmake -DLOG=off $srcdir
 make juggluco
 
+**********************************************************************************************************
+NOTE:
+I have used this command to make it:
+
+cd Common/src/main/cpp
+rm -rf build
+cmake -S . -B build \
+  -DLOG=off \
+  -DCMAKE_CXX_COMPILER=/usr/bin/g++-14 \
+  -DCMAKE_C_COMPILER=/usr/bin/gcc-14 \
+  -DCMAKE_CXX_FLAGS='-DSIBIONICS=0 -DTWILIOACCOUNT="" -DUSERPASSBASE64=""'
+cmake --build build --target juggluco --verbose
+
+also Added this file ( untracked )
+
+Common/src/main/cpp/net/ICE/jugglucoconnect.h
+
+// This file is intentionally NOT tracked in git.
+//
+// It is included verbatim inside the array initializer in
+// [`ICE.cpp`](Common/src/main/cpp/net/ICE/ICE.cpp:60):
+//
+//   constexpr const std::string_view hostnames[]{
+//     #include "jugglucoconnect.h"
+//   };
+//
+// Therefore, this file must contain ONLY a comma-separated list of
+// string literals (hostnames) and optional comments.
+//
+// Upstream `jugglucoconnect` server repo:
+//   https://github.com/j-kaltes/jugglucoconnect
+//
+// Replace "localhost" with your actual jugglucoconnect server hostname(s).
+
+"localhost"
+
+***********************************************************************************************************
 Juggluco server can also function as Nightscout/xDrip web server, export data and show images, see:
 https://www.juggluco.nl/Juggluco/webserver.html
 

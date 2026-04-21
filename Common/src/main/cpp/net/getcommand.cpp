@@ -33,6 +33,9 @@
 #include "aligner.hpp"
 #include "mirrorerror.h"
 
+// Optional MQTT publish (no-op if built with mqtt_stub.cpp or if not initialized).
+#include "mqtt/mqtt.hpp"
+
 #define lerrortag(...) lerror("getcommands: " __VA_ARGS__)
 #define LOGGERTAG(...) LOGGER("getcommands: " __VA_ARGS__)
 #define LOGARTAG(...) LOGAR("getcommands: " __VA_ARGS__)
@@ -231,17 +234,24 @@ for(int it=0;it<len;) {
                 }
             ret= filedata.close(us[1]);
             break;
-        case sglucose:
-            {comlen=4;
-            addlen(it,comlen);
-            if(it>len) {
-                return {it,comlen};
-                }
-            struct renderstruct *rend=reinterpret_cast<struct renderstruct*>(data);
-                processglucosevalue(rend->type);
-            ret=true;
-            }
-            break;
+	    	case sglucose:
+	    		{comlen=4;
+	    		addlen(it,comlen);
+	    		if(it>len) {
+	    			return {it,comlen};
+	    			}
+	    		struct renderstruct *rend=reinterpret_cast<struct renderstruct*>(data);
+	    			processglucosevalue(rend->type);
+
+	    			// Publish command/event notification.
+	    			// Keep payload minimal; mqtt::publish_json() expects an object.
+	    			{
+	    				const std::string json = std::string("{\"command\":\"sglucose\",\"type\":") + std::to_string(rend->type) + "}";
+	    				mqtt::publish_json("command", json);
+	    			}
+	    	ret=true;
+	    	}
+	    	break;
 #ifdef            JUGGLUCO_APP
             case sBlueWatch:
                 {comlen=sizeof(bluewatchstruct);

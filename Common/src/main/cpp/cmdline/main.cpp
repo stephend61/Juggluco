@@ -21,11 +21,22 @@
 
 #include <stdlib.h>
 
+#include <cmath>
+#include <cctype>
+#include <cstdio>
+#include <ctime>
+
 #include <signal.h>
+
+#include <string>
+#include <string_view>
 
 #include "datbackup.hpp"
 #include "nums/numdata.hpp"
 #include "settings/settings.hpp"
+
+#include "calibrate/Calibrator.hpp"
+#include "mqtt/mqtt.hpp"
 
 //extern bool setfilesdir(const string_view filesdir,const char *country) ;
 extern int startjuggluco(std::string_view dirfiles,const char *country) ;
@@ -302,6 +313,7 @@ int clearhosts() {
     }
 //#if defined(_Windows) || __ANDROID__
 const char dirconf[]=".jugglucorc";
+const char mqttconf[]=".mqttrc";
 
 //bool exportscans(int handle, const std::span<const ScanData>  (SensorGlucoseData::*proc)(void) const) ;
 
@@ -334,6 +346,7 @@ template <int N> bool setlabeltype(bool night,const int (&types)[N]) {
     }
 
  Readall alldir;
+ Readall allmqttrc;
 
 extern bool dumpQR(int pos);
 extern bool mkAutodumpQRReceiver() ;
@@ -345,15 +358,15 @@ int readconfig(int argc, char **argv) {
     bool list=false,clear=false;
     const char *password="";
     char *dir=nullptr;
-    string_view port;
+	string_view port;
 
     int rmindex=-1,reinitpos=-1;;
-const char * numexport=nullptr;
-const char *historyexport=nullptr;
-const char *scanexport=nullptr;
-const char *pollexport=nullptr;
-const char *libreviewexport=nullptr;
-const char *mealexport=nullptr;
+ const char * numexport=nullptr;
+ const char *historyexport=nullptr;
+ const char *scanexport=nullptr;
+ const char *pollexport=nullptr;
+ const char *libreviewexport=nullptr;
+ const char *mealexport=nullptr;
 const char *label=nullptr;
 bool xremote=false,activeonly=false,passiveonly=false,testip=true
 
@@ -605,33 +618,159 @@ char *api_secret=nullptr,*sslport=nullptr;
                }
            };
 static constexpr const    char defaultname[]="jugglucodata";
-    std::string_view uitdir;
-    if(!dir) {
-        if(!alldir.fromfile(dirconf)) {
-            uitdir={defaultname,sizeof(defaultname)-1};
-            }
-        else {
-            uitdir=alldir;
-            }
-        }
-    else {
+	// NOTE: `std::string_view::data()` is not guaranteed to be NUL-terminated.
+	// We must keep the directory in an owning std::string because this value is
+	// used with APIs expecting a C-string in other parts of the program.
+	std::string uitdir;
+
+	// Optional MQTT config (parsed from .mqttrc as key=value lines).
+	mqtt::Config mqtt_cfg{};
+	std::string mqtt_rc_err;
+
+	// `.jugglucorc` parsing (original behavior):
+	// - First non-empty, non-comment line without '=' is the data dir.
+	// - Any other lines are ignored (to keep the file dedicated to the data dir).
+	auto trim = [](std::string_view s) -> std::string_view {
+		while(!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r')) s.remove_prefix(1);
+		while(!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.remove_suffix(1);
+		return s;
+	};
+	
+	auto parse_dir_rc = [&](std::string_view text) -> bool {
+		bool have_dir = false;
+		std::string_view dir;
+
+		std::size_t pos = 0;
+		while(pos < text.size()) {
+			std::size_t end = text.find('\n', pos);
+			if(end == std::string_view::npos) end = text.size();
+			std::string_view line = text.substr(pos, end - pos);
+			pos = (end < text.size()) ? (end + 1) : end;
+
+			line = trim(line);
+			if(line.empty() || line.front() == '#') continue;
+
+			if(line.find('=') != std::string_view::npos) {
+				// Keep `.jugglucorc` dedicated to the data directory (historical behavior).
+				std::cerr << "Warning: ignoring key=value line in " << dirconf << " (use " << mqttconf << "): '" << line << "'\n";
+				continue;
+			}
+			if(!have_dir) {
+				dir = line;
+				have_dir = true;
+			} else {
+				std::cerr << "Warning: ignoring extra line in " << dirconf << ": '" << line << "'\n";
+			}
+		}
+
+		if(have_dir) {
+			uitdir.assign(dir.data(), dir.size());
+		}
+		return true;
+	};
+
+	// Optional `.mqttrc` parsing:
+	// - `key=value` lines only; currently supports `mqtt.*`
+	// - Unknown keys are warned and ignored (forward compatible)
+	auto parse_mqtt_rc = [&](std::string_view text) -> bool {
+		std::size_t pos = 0;
+		while(pos < text.size()) {
+			std::size_t end = text.find('\n', pos);
+			if(end == std::string_view::npos) end = text.size();
+			std::string_view line = text.substr(pos, end - pos);
+			pos = (end < text.size()) ? (end + 1) : end;
+
+			line = trim(line);
+			if(line.empty() || line.front() == '#') continue;
+
+			const std::size_t eq = line.find('=');
+			if(eq == std::string_view::npos) {
+				std::cerr << "Warning: ignoring line in " << mqttconf << ": '" << line << "'\n";
+				continue;
+			}
+
+			std::string_view key = trim(line.substr(0, eq));
+			std::string_view value = trim(line.substr(eq + 1));
+			if(key.empty()) continue;
+
+			if(key.rfind("mqtt.", 0) == 0) {
+				std::string err;
+				if(!mqtt::apply_kv(mqtt_cfg, key, value, err)) {
+					if(err.rfind("Unknown mqtt config key:", 0) == 0) {
+						std::cerr << "Warning: " << err << " (ignored)\n";
+						continue;
+					}
+					mqtt_rc_err = err;
+					return false;
+				}
+			} else {
+				std::cerr << "Warning: unknown config key '" << key << "' (ignored)\n";
+			}
+		}
+		return true;
+	};
+
+	if(!dir) {
+		if(!alldir.fromfile(dirconf)) {
+			uitdir.assign(defaultname, sizeof(defaultname) - 1);
+			}
+		else {
+			if(!parse_dir_rc(alldir)) {
+				if(!mqtt_rc_err.empty()) {
+					std::cerr << "Invalid MQTT config: " << mqtt_rc_err << "\n";
+				}
+				return 10;
+			}
+			if(uitdir.empty()) {
+				// Config file exists but does not contain an explicit data dir.
+				uitdir.assign(defaultname, sizeof(defaultname) - 1);
+			}
+			}
+		}
+
+	// Load optional MQTT config from `.mqttrc` (separate from `.jugglucorc`).
+	// Absence is not an error.
+	if(allmqttrc.fromfile(mqttconf)) {
+		if(!parse_mqtt_rc(allmqttrc)) {
+			if(!mqtt_rc_err.empty()) {
+				std::cerr << "Invalid MQTT config in " << mqttconf << ": " << mqtt_rc_err << "\n";
+			}
+			return 10;
+		}
+	}
+
+	if(dir) {
         int dirend=strlen(dir)-1;
         for(;dir[dirend]=='/'||dir[dirend]=='\\';dirend--)
             dir[dirend]='\0';    
         int dirlen=dirend+1;
-        if(!writeall(dirconf,dir,dirlen)) {
-            cerr<<"Write to "<<dirconf<<" failed\n";
-            }
-        alldir.assign(dir,dirlen);
-        uitdir=alldir;
-        }
-    cout<<"Saving in directory "<<uitdir.data()<<endl;
-    bool did=false;
-    switch(startjuggluco(uitdir,nullptr)) {
-        case 0:break;
-        default: return 10;
-        };
-    did=did||setlabeltype(night,labeltype);
+		if(!writeall(dirconf,dir,dirlen)) {
+			cerr<<"Write to "<<dirconf<<" failed\n";
+			}
+		alldir.assign(dir,dirlen);
+		uitdir.assign(dir, dirlen);
+		}
+	cout<<"Saving in directory "<<uitdir<<endl;
+	bool did=false;
+	switch(startjuggluco(std::string_view(uitdir),nullptr)) {
+		case 0:break;
+		default: return 10;
+		};
+
+	// Only start MQTT if we are not running a pure export-to-file command.
+	const bool doing_export = (numexport != nullptr) || (historyexport != nullptr) || (scanexport != nullptr) ||
+	                          (pollexport != nullptr) || (libreviewexport != nullptr) || (mealexport != nullptr);
+	if(!doing_export) {
+		std::string err;
+		const std::uint64_t device_id = static_cast<std::uint64_t>(settings->data()->jugglucoID);
+		if(!mqtt::init(device_id, mqtt_cfg, err)) {
+			std::cerr << err << "\n";
+			return 10;
+		}
+		mqtt::publish_json("status", "{\"status\":\"started\"}");
+	}
+
+	did=did||setlabeltype(night,labeltype);
 
     if(sslport) {
         int sport;
@@ -875,8 +1014,8 @@ static void wakeup() {
     //    backup->wakebackup();
     }
 void exitproc() {
-    cout<<"This is a normal exit"<<endl;
-    }
+	mqtt::shutdown();
+	}
  unsigned int alarm(unsigned int seconds);
 // #include "SensorGlucoseData.hpp"
 static    void setalarm();
@@ -885,14 +1024,17 @@ int main(int argc,char **argv) {
 //    if(active) backup->stopreceiver();
 //    backup->changehost(0,"192.168.1.69","8795", false,false,false,false,true,true,"1234567890123456");
 //    SensorGlucoseData test("/tmp/sensors/E07A-XX09K9HHHAJ",5);
+
+	// Ensure clean shutdown even when `readconfig()` returns early (e.g. `-l`).
+	signal(SIGUSR1,sighandler);
+	atexit(exitproc);
+
     if(int ret=readconfig(argc,argv)) {
         if(ret==1234)
             return 0;
         return ret;
         }
     networkpresent=true;
-    signal(SIGUSR1,sighandler);
-    atexit(exitproc);
     setalarm();
 
     if(settings->data()->usexdripwebserver) {
@@ -936,6 +1078,124 @@ void     processglucosevalue(int sendindex,int newstart) {
                     senso->finished=0;
                     backup->resensordata(sendindex);
                     }
+
+				// MQTT: publish both raw and calibrated values (if available).
+				// Raw is always present; calibrated is computed locally from calibration parameters.
+				{
+					// Format with exactly 1 decimal place (avoid std::to_string()'s 6 decimals).
+					auto format_1dp = [](double v) {
+						char buf[64]{};
+						// C locale assumed throughout the project; emit '.' decimal.
+						std::snprintf(buf, sizeof(buf), "%.1f", v);
+						return std::string(buf);
+					};
+					auto format_6dp = [](double v) {
+						char buf[64]{};
+						std::snprintf(buf, sizeof(buf), "%.6f", v);
+						return std::string(buf);
+					};
+
+					const int raw_mgdl = static_cast<int>(poll->getmgdL());
+					// Convert to mmol/L (mg/dL / 18). Emit 1 decimal place for stability.
+					const double raw_mmol_round1 = std::round((static_cast<double>(raw_mgdl) / 18.0) * 10.0) / 10.0;
+
+					// Local time string (uses container TZ).
+					std::string time_local;
+					int tz_offset_min = 0;
+					bool have_tz = false;
+					{
+						const std::time_t t = static_cast<std::time_t>(poll->gettime());
+						std::tm tm{};
+						char buf[32]{};
+						if(localtime_r(&t, &tm)) {
+							if(std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm) > 0) {
+								time_local = buf;
+							}
+							// Timezone offset, based on runtime's local timezone.
+							// %z yields "+HHMM" or "-HHMM".
+							char zbuf[8]{};
+							if(std::strftime(zbuf, sizeof(zbuf), "%z", &tm) > 0) {
+								const char s = zbuf[0];
+								if((s == '+' || s == '-') && std::isdigit(static_cast<unsigned char>(zbuf[1])) && std::isdigit(static_cast<unsigned char>(zbuf[2])) &&
+								   std::isdigit(static_cast<unsigned char>(zbuf[3])) && std::isdigit(static_cast<unsigned char>(zbuf[4]))) {
+									const int hh = (zbuf[1] - '0') * 10 + (zbuf[2] - '0');
+									const int mm = (zbuf[3] - '0') * 10 + (zbuf[4] - '0');
+									const int sign = (s == '-') ? -1 : 1;
+									tz_offset_min = sign * (hh * 60 + mm);
+									have_tz = true;
+								}
+							}
+						}
+					}
+
+					// Calibrated value handling:
+					// - Try to compute a calibrated mg/dL value when possible.
+					// - If not available (NaN), fall back to the raw value.
+					// This makes the MQTT payload stable/complete without requiring
+					// any particular runtime calibration setting.
+					bool cal_available = false;
+					double cal_mgdl = static_cast<double>(raw_mgdl);
+					{
+						// Match export calibration behavior: build calibrator from sensor data
+						// and use calibrateONE() for the concrete sample.
+						const SensorGlucoseData *sensdata = hist;
+						auto cali = make_calibrator<ScanData>(sensdata);
+						const double maybe = cali.calibrateONE(*poll);
+						if(!std::isnan(maybe)) {
+							cal_available = true;
+							cal_mgdl = maybe;
+						}
+					}
+
+					std::string json;
+					json.reserve(160);
+					json += "{";
+					json += "\"sensor_index\":" + std::to_string(sendindex);
+					{
+						// Sensor identifier (typically 11 chars like "1QBA5A04503").
+						// Keep this as a string so it matches export output and is stable across platforms.
+						const std::string_view sid = hist->showsensorname();
+						if(!sid.empty()) {
+							json += ",\"sensor_id\":\"";
+							json.append(sid.data(), sid.size());
+							json += "\"";
+						}
+					}
+					// Backward compatible: keep numeric unix seconds as `time`.
+					json += ",\"time\":" + std::to_string(static_cast<unsigned long long>(poll->gettime()));
+					if(!time_local.empty()) {
+						json += ",\"time_local\":\"";
+						json += time_local;
+						json += "\"";
+					}
+					if(have_tz) {
+						// Export-style TZ column (hours offset from UTC). May be fractional for half-hour zones.
+						char tznum[32]{};
+						if((tz_offset_min % 60) == 0) {
+							std::snprintf(tznum, sizeof(tznum), "%d", tz_offset_min / 60);
+						} else {
+							std::snprintf(tznum, sizeof(tznum), "%.1f", static_cast<double>(tz_offset_min) / 60.0);
+						}
+						json += ",\"tz\":";
+						json += tznum;
+					}
+					json += ",\"minute_index\":" + std::to_string(static_cast<unsigned long long>(poll->getid()));
+					json += ",\"raw_mgdl\":" + std::to_string(raw_mgdl);
+					json += ",\"raw_mmol\":" + format_1dp(raw_mmol_round1);
+					// Emit `cal_*` always; fall back to raw if unavailable.
+					// Round to 1 decimal place for stability.
+					const double cal_round1 = std::round(cal_mgdl * 10.0) / 10.0;
+					const double cal_mmol_round1 = std::round((cal_round1 / 18.0) * 10.0) / 10.0;
+					json += ",\"cal_mgdl\":" + format_1dp(cal_round1);
+					json += ",\"cal_mmol\":" + format_1dp(cal_mmol_round1);
+					json += ",\"cal_available\":";
+					json += (cal_available ? "true" : "false");
+					json += ",\"change\":" + format_6dp(static_cast<double>(poll->getchange()));
+					json += ",\"trend\":" + std::to_string(static_cast<unsigned long long>(poll->tr));
+					json += "}";
+
+					mqtt::publish_json("glucose", json);
+				}
 
                 }
             else {
@@ -1009,4 +1269,3 @@ extern std::string_view dMODEL;
 std::string_view dMANUFACTURER="MANUFACTURER";
  std::string_view dMODEL="MODEL";
  */
-
