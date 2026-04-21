@@ -1015,6 +1015,7 @@ static void wakeup() {
     }
 void exitproc() {
 	mqtt::shutdown();
+	cout<<"This is a normal exit"<<endl;
 	}
  unsigned int alarm(unsigned int seconds);
 // #include "SensorGlucoseData.hpp"
