@@ -1,0 +1,16 @@
+# IDE
+.idea/
+
+# Gradle
+.gradle/
+
+# CMake / build outputs
+**/build/
+
+# Explicitly ignore the CMake build dir used by the command-line server build
+Common/src/main/cpp/build/
+Common/src/main/cpp/build/**
+
+# Common explicit cache file (redundant with build/ ignores, but kept for clarity)
+Common/src/main/cpp/build/CMakeCache.txt
+
