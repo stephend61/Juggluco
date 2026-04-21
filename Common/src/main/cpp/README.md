@@ -2,21 +2,76 @@ For more information see: https://www.juggluco.nl/Juggluco/cmdline/index.html
 
 ## Building
 
-Compile for debugging with:
+This directory contains the CMake project for the **desktop/server** command-line binary `juggluco`.
+
+Run the following commands from [`Common/src/main/cpp/`](.:1).
+
+### Debug build (logging enabled)
 
 ```sh
-cmake -DDEBUG=on $srcdir
-make juggluco
+cmake -S . -B build -DDEBUG=ON -DLOG=ON
+cmake --build build --target juggluco -j
 ```
 
-Replace `$srcdir` with the directory containing the C++ source of Juggluco (the directory that contains `CMakeLists.txt`).
-
-To compile without logging and debug information (in a fresh directory):
+### Release build (logging disabled)
 
 ```sh
-cmake -DLOG=off $srcdir
-make juggluco
+cmake -S . -B build-release -DDEBUG=OFF -DLOG=OFF
+cmake --build build-release --target juggluco -j
 ```
+
+Notes:
+
+- The `DEBUG` CMake option is declared in [`CMakeLists.txt`](CMakeLists.txt:4).
+- `LOG` is treated as a CMake variable toggle: when it is OFF/empty, `-DNOLOG=1` is added in [`CMakeLists.txt`](CMakeLists.txt:14).
+- The default C++ standard for the desktop build is currently set to `-std=gnu++26` in [`CMakeLists.txt`](CMakeLists.txt:38).
+- Avoid setting `-DCMAKE_BUILD_TYPE=...` for this project: the top-level logic in [`CMakeLists.txt`](CMakeLists.txt:2) uses its own `DEBUG`/`LOG` switches.
+
+## Runtime dependencies (running the `juggluco` executable)
+
+The exact runtime dependencies depend on how you built the binary (static vs dynamic, MQTT enabled, etc.).
+
+### Linux
+
+On Linux, `juggluco` is typically dynamically linked against system libraries such as:
+
+- OpenSSL (`libssl` + `libcrypto`) for HTTPS/SSL features
+- zlib (`libz`)
+- pthread (`libpthread`)
+- `libm`, `libdl`, and the system C/C++ runtime
+
+If you enabled MQTT (`-DJUGGLUCO_MQTT=ON`), you will also need:
+
+- Eclipse Mosquitto client library (`libmosquitto`)
+
+To see the exact list for your build:
+
+```sh
+ldd ./juggluco
+```
+
+### Windows
+
+On Windows, you typically need to ship the required DLLs alongside `juggluco.exe` (or have them available in `PATH`).
+
+Common runtime DLLs include:
+
+- OpenSSL DLLs matching your build (e.g. `libssl-*.dll`, `libcrypto-*.dll`)
+- If MQTT is enabled: `mosquitto.dll` (and any of its dependencies)
+
+To see what your binary depends on:
+
+- Visual Studio Developer Command Prompt:
+
+  ```bat
+  dumpbin /DEPENDENTS juggluco.exe
+  ```
+
+- Or with MinGW tools:
+
+  ```sh
+  objdump -p juggluco.exe | grep -i "DLL Name"
+  ```
 
 Juggluco server can also function as Nightscout/xDrip web server, export data and show images, see:
 https://www.juggluco.nl/Juggluco/webserver.html
@@ -60,9 +115,17 @@ MQTT settings are read from a separate config file named `.mqttrc` (to avoid acc
 
 The data directory is configured separately via `.jugglucorc`.
 
-- Format: first non-empty, non-comment line is the directory name/path.
+- Format: first non-empty, non-comment line **without `=`** is the directory name/path.
 - This file may be updated/overwritten by command-line options that change the data directory (e.g. `-d`).
 - Keep MQTT settings out of this file; put them in `.mqttrc`.
+
+Example `.jugglucorc`:
+
+```text
+jugglucodata
+```
+
+Both `.jugglucorc` and `.mqttrc` are read from the **current working directory** (the directory you run `juggluco` from). See [`dirconf`](cmdline/main.cpp:315) / [`mqttconf`](cmdline/main.cpp:316).
 
 Example `.mqttrc`:
 
@@ -113,11 +176,27 @@ Example payload:
 
 2) **`glucose`** (latest glucose point)
 
-Published from [`processglucosevalue()`](cmdline/main.cpp:1019) when a fresh stream value is available.
+Published from [`processglucosevalue()`](cmdline/main.cpp:1062) when a fresh stream value is available.
 
 3) **`status`** (startup notification)
 
-Published once during startup from [`readconfig()`](cmdline/main.cpp:616) after MQTT init.
+Published once during startup from [`readconfig()`](cmdline/main.cpp:356) after MQTT init.
+
+Example topic (default):
+
+```
+juggluco/status
+```
+
+Example payload:
+
+```json
+{
+  "status": "started"
+}
+
+This payload is currently fixed (it does not include timestamps or device id).
+```
 
 Example topic (default):
 
@@ -217,124 +296,4 @@ Two common approaches:
 
    In this case you may also need to ensure your CMake generator/compiler matches the MSYS2 toolchain you installed.
 
-If CMake fails to find Mosquitto, it means it cannot locate `mosquitto.h` and/or the `mosquitto` library. The build system searches for these via `find_path()` / `find_library()` when [`JUGGLUCO_MQTT`](CMakeLists.txt:31) is ON.
-
-## Repository / build hygiene notes
-
-### Do not commit build outputs
-
-This repo includes a `.gitignore` that ignores common build artifacts and IDE files. In particular, it ignores:
-
-- CMake generator output (e.g. `CMakeFiles/`, `CMakeCache.txt`, `cmake_install.cmake`, `Makefile`)
-- IDE metadata (e.g. `.idea/`, `.vscode/`)
-- Local runtime data (`.jugglucorc`, `jugglucodata/`)
-- Local runtime data (`.jugglucorc`, `.mqttrc`, `jugglucodata/`)
-
-If you see CMake-generated files like `cmake_install.cmake`, `LibJuiceConfig*.cmake`, or generated `Makefile`s showing up as changes, it usually means CMake was run **in the source tree**. Prefer out-of-source builds (see below).
-
-### Prefer out-of-source builds
-
-Running CMake in a separate directory keeps generated files out of the source tree:
-
-```sh
-mkdir -p build
-cmake -S . -B build -DDEBUG=on
-cmake --build build --target juggluco
-```
-
-### Toolchain compatibility changes
-
-Some code was adjusted to build on more common Linux toolchains:
-
-- The build uses `-std=gnu++23` rather than `-std=gnu++26`.
-- Some C++23 features that are not reliably supported everywhere (e.g. explicit object parameter / “deducing this”, and `std::ranges::contains_subrange`) were replaced with conventional/portable alternatives.
-
-## Non-MQTT changes (what changed and why)
-
-This section documents changes that were made **for build portability and repo hygiene**, not for the MQTT feature itself.
-
-### 1) `.gitignore` + stop tracking generated artifacts
-
-**What changed**
-
-- Added [`/.gitignore`](.gitignore:1) to ignore build artifacts (CMake output, objects, libraries, binaries), IDE metadata, and local runtime data.
-- Removed already-tracked build/IDE outputs from Git history going forward (commit `6360c6d`).
-- Stopped tracking the generated file [`curve/arjugglucotext.cpp`](curve/arjugglucotext.cpp:1) and added it to ignore.
-
-**Why**
-
-- Build products like `CMakeFiles/`, `CMakeCache.txt`, object files, and generated `Makefile`s change constantly and should not be versioned. Keeping them out of Git makes diffs reviewable and avoids accidental commits.
-- [`curve/arjugglucotext.cpp`](curve/arjugglucotext.cpp:1) is a generated output. It is produced by the CMake custom command declared in [`CMakeLists.txt`](CMakeLists.txt:88) through [`CMakeLists.txt:112`](CMakeLists.txt:112) (the `generate_arjugglucotext` target). Only the input template [`curve/arjugglucotext.in.cpp`](CMakeLists.txt:88) should be treated as source.
-
-### 2) Make the build less dependent on bleeding-edge compiler support
-
-#### 2.1 Use C++23 rather than `gnu++26`
-
-**What changed**
-
-- The default standard flag was changed from `-std=gnu++26` to `-std=gnu++23` in [`CMakeLists.txt`](CMakeLists.txt:35).
-
-**Why**
-
-- `gnu++26` is not widely supported on stable distro toolchains. Using C++23 keeps the code modern while improving the chance that a stock GCC/Clang will build the project.
-
-#### 2.2 Fix a CMake flags bug when `sys/prctl.h` is missing
-
-**What changed**
-
-- Fixed an assignment that accidentally replaced `CMAKE_CXX_FLAGS` with `CMAKE_C_FLAGS` in the `HAVE_PRCTL` fallback path. See [`CMakeLists.txt:49`](CMakeLists.txt:49).
-
-**Why**
-
-- Overwriting `CMAKE_CXX_FLAGS` can drop the configured `-std=...` and other C++ flags, leading to confusing compile errors (templates, `requires`, `std::span`, etc.).
-
-### 3) Replace toolchain-incomplete C++23 features with portable alternatives
-
-#### 3.1 Replace C++23 “deducing this” (explicit object parameter)
-
-**What changed**
-
-Several headers used the C++23 explicit object parameter syntax (the `this Self&& self` form). This was replaced with conventional member functions and `const` overloads.
-
-Examples:
-
-- [`settings/settings.hpp`](settings/settings.hpp:419) (GlucoseMeter helpers)
-- [`net/TCPConnect.hpp`](net/TCPConnect.hpp:40) (socket getter helpers)
-- [`net/ICE/PlaceBuf.hpp`](net/ICE/PlaceBuf.hpp:64) (buffer `data()` / `operator[]`)
-- [`datbackup.hpp`](datbackup.hpp:165) (connection accessor)
-
-**Why**
-
-- GCC 13 (common on Linux) does not reliably support this syntax even under `-std=gnu++23`, so removing it improves build compatibility without changing intended behavior.
-
-#### 3.2 Replace `std::ranges::contains_subrange`
-
-**What changed**
-
-- Replaced `std::ranges::contains_subrange(...)` usage with `std::search(...)` in [`sensoren.hpp`](sensoren.hpp:728).
-
-**Why**
-
-- `std::ranges::contains_subrange` is a C++23 library facility and may be missing depending on libstdc++ version. `std::search` is widely available and sufficient here.
-
-### 4) Fix missing standard header include
-
-**What changed**
-
-- Added `<format>` include in [`hostJson.cpp`](hostJson.cpp:27).
-
-**Why**
-
-- The file uses `std::format_to` (see [`hostJson.cpp:34`](hostJson.cpp:34)); some standard libraries require explicitly including `<format>`.
-
-### 5) Notes about accidental CMake-generated files
-
-If CMake is run **in the source tree**, it may generate extra files such as:
-
-- [`cmake_install.cmake`](cmake_install.cmake:1)
-- [`LibJuiceConfig.cmake`](LibJuiceConfig.cmake:1)
-- [`LibJuiceConfigVersion.cmake`](LibJuiceConfigVersion.cmake:1)
-- [`libjuice/Makefile`](libjuice/Makefile:1)
-- [`libjuice/cmake_install.cmake`](libjuice/cmake_install.cmake:1)
-
-These are CMake-generated outputs (see headers like “CMAKE generated file: DO NOT EDIT!” in [`libjuice/Makefile`](libjuice/Makefile:1)) and are typically not intended to be committed. Prefer an out-of-source build (example above) to avoid generating them in the repo root.
+If CMake fails to find Mosquitto, it means it cannot locate `mosquitto.h` and/or the `mosquitto` library. The build system searches for these via `find_path()` / `find_library()` when [`JUGGLUCO_MQTT`](CMakeLists.txt:32) is ON.
